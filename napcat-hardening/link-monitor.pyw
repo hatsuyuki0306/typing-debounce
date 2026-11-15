@@ -42,6 +42,7 @@ bot链路监控（无窗口版）
 
 import json
 import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -54,6 +55,25 @@ GRACE_SEC = 120              # 服务刚启动的宽限期内不动它（秒）
 RESTART_COOLDOWN_SEC = 300   # 两次自动重启最小间隔（秒），防抖
 MAX_RESTARTS = 3             # 同一轮故障最多自动重启次数，用尽转人工停服
 CREATE_NO_WINDOW = 0x08000000
+
+# ── GitHub 备份同步（2026-11-15 并入本脚本）──────────────────────────
+#
+# 用户要求：「把那个检测 github 同步的定时任务合并到检查链路的定时任务内」。
+#
+# 为什么放在这里而不是单独建任务：
+#   本脚本已经每 5 分钟跑一次，再加一个 5 分钟级的计划任务纯属浪费。
+#   而且「链路检查」和「备份同步」都是运维巡检，属同一类职责。
+#
+# 为什么不能每 5 分钟都推：
+#   那会产生大量空提交和磁盘 churn。所以用两道闸：
+#   ① 先跑 `--quick` 问一句「有没有改动」，没改动直接返回（耗时约 1 秒）
+#   ② 即便有改动，也要距上次同步 >= SYNC_MIN_INTERVAL_SEC 才真的推
+#
+# 为什么不用计划任务里配 `--public` 之类：
+#   两个仓库都要同步，直接跑全量。
+SYNC_MIN_INTERVAL_SEC = 6 * 3600   # 两次真实同步之间至少隔 6 小时
+SYNC_SCRIPT = Path(r"<HOME>\Desktop\dsh\自主智能体\_github\sync-to-github.py")
+SYNC_STATE_KEY = "githubSyncAt"    # 存在 link-state.json 里，跨轮次累计
 
 
 def log(msg: str) -> None:
@@ -215,6 +235,78 @@ def recover(prev: dict, st: dict, failures: int) -> dict:
             "note": "重启次数已用尽，停服等待人工扫码" + ("" if ok else "（停服未确认）")}
 
 
+def sync_github(prev: dict) -> dict:
+    """按需把项目改动同步到两个 GitHub 仓库。返回更新后的同步状态。
+
+    绝不抛异常：备份失败不能影响链路监控本身。
+    三道闸：
+      ① 脚本不存在就跳过
+      ② `--quick` 说没改动就跳过（耗时约 1 秒）
+      ③ 距上次同步不足 SYNC_MIN_INTERVAL_SEC 就跳过
+    """
+    import time
+
+    result = {
+        SYNC_STATE_KEY: float((prev or {}).get(SYNC_STATE_KEY) or 0),
+        "githubSyncResult": str((prev or {}).get("githubSyncResult") or ""),
+    }
+
+    if not SYNC_SCRIPT.exists():
+        return result
+
+    last = result[SYNC_STATE_KEY]
+    elapsed = time.time() - last
+    if last and elapsed < SYNC_MIN_INTERVAL_SEC:
+        # 还没到间隔，连 --quick 都不用跑
+        return result
+
+    try:
+        # ── 闸②：先问一句有没有改动（退出码 10 = 有改动）──
+        quick = subprocess.run(
+            [sys.executable, str(SYNC_SCRIPT), "--quick"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=60, creationflags=CREATE_NO_WINDOW,
+        )
+        if quick.returncode == 0:
+            return result                     # 无改动，静默跳过
+        if quick.returncode != 10:
+            log("GitHub 同步预检异常：退出码 %d %s"
+                % (quick.returncode, (quick.stdout or "").strip()[:120]))
+            return result
+
+        # ── 真的同步 ──
+        log("检测到项目改动，开始同步 GitHub：" + (quick.stdout or "").strip()[:120])
+        r = subprocess.run(
+            [sys.executable, str(SYNC_SCRIPT)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=600, creationflags=CREATE_NO_WINDOW,
+        )
+        out = ((r.stdout or "") + (r.stderr or "")).strip()
+
+        if r.returncode == 0 and "脱敏检查未通过" not in out:
+            result[SYNC_STATE_KEY] = time.time()
+            # 只在真的推了东西时才记「已推送」，避免无改动也写一行
+            pushed = "已推送" in out
+            result["githubSyncResult"] = "pushed" if pushed else "nochange"
+            log("GitHub 同步完成（%s）" % ("已推送" if pushed else "无实质改动"))
+        elif r.returncode == 2 or "脱敏检查未通过" in out:
+            # 脱敏闸拦截：这是保护机制生效，不是故障，但必须让人知道
+            result["githubSyncResult"] = "blocked"
+            log("⚠ GitHub 同步被脱敏检查拦下（保护机制生效，需人工修 build-public-repo.py）")
+            toast("GitHub 同步被拦下", "脱敏检查发现敏感串，已按设计中止推送")
+        else:
+            result["githubSyncResult"] = "error"
+            log("GitHub 同步失败（退出码 %d）：%s" % (r.returncode, out[-300:]))
+    except subprocess.TimeoutExpired:
+        result["githubSyncResult"] = "timeout"
+        log("GitHub 同步超时（>600s），下轮再试")
+    except Exception as e:
+        result["githubSyncResult"] = "exc"
+        log("GitHub 同步异常：%s" % e)
+
+    return result
+
+
 def main() -> None:
     st = check_status()
     listening, conns, svc, failures = st["listening"], st["conns"], st["svc"], st["failures"]
@@ -307,6 +399,18 @@ def main() -> None:
 
     STATE.parent.mkdir(parents=True, exist_ok=True)
     STATE.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+
+    # ── GitHub 备份同步（2026-11-15 并入）────────────────────────────
+    # 放在状态落盘之后：链路检查先完成并留存，备份同步即便出问题也不影响它。
+    # sync_github 内部已 try/except 全覆盖，不会抛出来打断本脚本。
+    try:
+        sync_result = sync_github(prev or {})
+        if sync_result != {k: (prev or {}).get(k) for k in sync_result}:
+            state.update(sync_result)
+            STATE.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        # 兜底：绝不让备份同步的意外破坏链路监控
+        log("GitHub 同步外层异常（已忽略）：%s" % e)
 
 
 if __name__ == "__main__":
