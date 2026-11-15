@@ -235,6 +235,23 @@ def recover(prev: dict, st: dict, failures: int) -> dict:
             "note": "重启次数已用尽，停服等待人工扫码" + ("" if ok else "（停服未确认）")}
 
 
+def _safe_float(v, default=0.0) -> float:
+    """把任意值安全转成 float。
+
+    为什么需要：link-state.json 是磁盘文件，可能被外部改坏、被旧版本写成字符串、
+    或断电时写了一半。`float("not-a-number")` 会抛 ValueError，
+    而这里的调用方是每 5 分钟跑一次的监控脚本 —— 一个坏字段不能让整个监控挂掉。
+    """
+    try:
+        f = float(v)
+        # NaN / inf 也当作无效（JSON 里不该出现，但防御一下）
+        if f != f or f in (float("inf"), float("-inf")):
+            return default
+        return f
+    except (TypeError, ValueError):
+        return default
+
+
 def sync_github(prev: dict) -> dict:
     """按需把项目改动同步到两个 GitHub 仓库。返回更新后的同步状态。
 
@@ -247,7 +264,7 @@ def sync_github(prev: dict) -> dict:
     import time
 
     result = {
-        SYNC_STATE_KEY: float((prev or {}).get(SYNC_STATE_KEY) or 0),
+        SYNC_STATE_KEY: _safe_float((prev or {}).get(SYNC_STATE_KEY)),
         "githubSyncResult": str((prev or {}).get("githubSyncResult") or ""),
     }
 
@@ -345,7 +362,8 @@ def main() -> None:
         "restarts": int((prev or {}).get("restarts") or 0),
         "lastRestartAt": float((prev or {}).get("lastRestartAt") or 0),
         # GitHub 同步状态（必须在这里带上，否则回写时会丢）
-        "githubSyncAt": float((prev or {}).get("githubSyncAt") or 0),
+        # 用 _safe_float：状态文件可能被写坏，坏值不能拖垮监控
+        "githubSyncAt": _safe_float((prev or {}).get("githubSyncAt")),
         "githubSyncResult": str((prev or {}).get("githubSyncResult") or ""),
     }
 
