@@ -404,9 +404,15 @@ def main() -> None:
     # 放在状态落盘之后：链路检查先完成并留存，备份同步即便出问题也不影响它。
     # sync_github 内部已 try/except 全覆盖，不会抛出来打断本脚本。
     try:
-        sync_result = sync_github(prev or {})
-        if sync_result != {k: (prev or {}).get(k) for k in sync_result}:
-            state.update(sync_result)
+        sync_state = {
+            "githubSyncAt": float(state.get("githubSyncAt") or 0),
+            "githubSyncResult": str(state.get("githubSyncResult") or ""),
+        }
+        new_sync = sync_github(sync_state)
+        # 只有确实变化了才回写（避免每轮都重写状态文件）
+        if (new_sync.get("githubSyncAt") != sync_state["githubSyncAt"]
+                or new_sync.get("githubSyncResult") != sync_state["githubSyncResult"]):
+            state.update(new_sync)
             STATE.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
     except Exception as e:
         # 兜底：绝不让备份同步的意外破坏链路监控
