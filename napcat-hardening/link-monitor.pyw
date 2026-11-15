@@ -344,6 +344,9 @@ def main() -> None:
         # 分级处置的持久化状态（跨轮次累计，用于 MAX_RESTARTS 与冷却）
         "restarts": int((prev or {}).get("restarts") or 0),
         "lastRestartAt": float((prev or {}).get("lastRestartAt") or 0),
+        # GitHub 同步状态（必须在这里带上，否则回写时会丢）
+        "githubSyncAt": float((prev or {}).get("githubSyncAt") or 0),
+        "githubSyncResult": str((prev or {}).get("githubSyncResult") or ""),
     }
 
     if online:
