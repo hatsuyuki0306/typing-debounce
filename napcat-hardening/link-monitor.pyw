@@ -285,7 +285,16 @@ def sync_github(prev: dict) -> dict:
             timeout=60, creationflags=CREATE_NO_WINDOW,
         )
         if quick.returncode == 0:
-            return result                     # 无改动，静默跳过
+            # 无改动。**必须把 result 改成 nochange**，不能原样返回：
+            # 否则上一次的错误标记（error/blocked）会一直粘在状态文件里，
+            # 明明同步已经恢复正常，看状态却还是红的 —— 2026-11-17 排查时
+            # 就被这个假信号带偏过。
+            # 这里故意**不推进 githubSyncAt**：nochange 不算一次真同步，不占
+            # 6 小时配额。效果是「上次真同步已超过 6 小时」时每轮都用 --quick
+            # （约 1.5s）探一次，一有改动就推，不必等满 6 小时。
+            if result.get("githubSyncResult") != "nochange":
+                result["githubSyncResult"] = "nochange"
+            return result
         if quick.returncode != 10:
             log("GitHub 同步预检异常：退出码 %d %s"
                 % (quick.returncode, (quick.stdout or "").strip()[:120]))
